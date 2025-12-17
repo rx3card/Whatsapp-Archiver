@@ -2,10 +2,73 @@ const { default: makeWASocket, useMultiFileAuthState, downloadMediaMessage, Disc
 const P = require('pino');
 const fs = require('fs');
 const path = require('path');
-const qrcode = require('qrcode-terminal');  // <-- Añadido esto
+const qrcode = require('qrcode-terminal');
 const { iniciar, guardar } = require('./db');
 
+function crearCarpetasMultimedia() {
+  const carpetas = [
+    'media/images',
+    'media/videos',
+    'media/audios',
+    'media/docs',
+    'media/stickers'
+  ];
+
+  carpetas.forEach(carpeta => {
+    const ruta = path.join(__dirname, carpeta);
+    
+    if (!fs.existsSync(ruta)) {
+      fs.mkdirSync(ruta, { recursive: true });
+      console.log(`✅ Carpeta creada: ${carpeta}`);
+    }
+  });
+
+  console.log('📁 Carpetas de multimedia listas');
+}
+
+function obtenerTelefonoReal(m) {
+  let jid = m.key.participant || m.key.remoteJid || '';
+  let numero = jid.split('@')[0];
+
+  if (/^\d{10,15}$/.test(numero)) {
+    return numero;
+  }
+
+  if (/^\d{16,}$/.test(numero)) {
+    console.log(`⚠️ Detectado ID largo (probablemente Estado o contacto no guardado): ${numero}`);
+    return 'Desconocido (Estado)';
+  }
+
+  if (jid.includes('@g.us')) {
+    return numero || 'Grupo desconocido';
+  }
+
+  return 'Desconocido';
+}
+
+async function descargarConReintentos(m, sock, intentos = 3) {
+  for (let i = 0; i < intentos; i++) {
+    try {
+      return await downloadMediaMessage(
+        m,
+        'buffer',
+        {},
+        {
+          logger: P({ level: 'error' }),
+          reuploadRequest: sock.updateMediaMessage,
+          options: { timeoutMs: 30000 },
+        }
+      );
+    } catch (err) {
+      if (i === intentos - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
+    }
+  }
+}
+
 async function start() {
+  crearCarpetasMultimedia();
+
   await iniciar();
 
   const { state, saveCreds } = await useMultiFileAuthState('auth');
@@ -13,16 +76,15 @@ async function start() {
   const sock = makeWASocket({
     auth: state,
     logger: P({ level: 'silent' }),
-    // Quitamos printQRInTerminal para eliminar el warning
+    getMessage: async () => ({}),
   });
 
-  // Manejo manual del QR (sin warning y con estilo bonito)
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
       console.log('📱 Escanea este QR con tu WhatsApp:');
-      qrcode.generate(qr, { small: true });  // QR bonito y compacto en la terminal
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'open') {
@@ -31,10 +93,8 @@ async function start() {
 
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('❌ Conexión cerrada', shouldReconnect ? '→ Reconectando...' : '→ Sesión cerrada (escanea de nuevo)');
-      if (shouldReconnect) {
-        start();
-      }
+      console.log('❌ Conexión cerrada', shouldReconnect ? '→ Reconectando...' : '→ Sesión cerrada');
+      if (shouldReconnect) start();
     }
   });
 
@@ -44,7 +104,9 @@ async function start() {
     for (const m of messages) {
       if (!m.message || m.key.fromMe) continue;
 
-      const telefono = (m.key.participant || m.key.remoteJid).split('@')[0];
+      const telefono = obtenerTelefonoReal(m);
+      const nombre = m.pushName || m.verifiedBizName || 'Sin nombre';
+      const jid = m.key.participant || m.key.remoteJid;
       const messageType = Object.keys(m.message)[0];
 
       let texto = null;
@@ -53,40 +115,50 @@ async function start() {
       if (m.message.conversation) texto = m.message.conversation;
       else if (m.message.extendedTextMessage?.text) texto = m.message.extendedTextMessage.text;
 
-      if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].includes(messageType)) {
-        try {
-          const buffer = await downloadMediaMessage(m, 'buffer', {}, { sock });
+      if (['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].includes(messageType)) {
+        const msg = m.message[messageType];
 
-          let carpeta = 'docs';
-          let ext = '.bin';
+        if (!msg.mediaKey || !msg.directPath) {
+          console.log(`⚠️ ${messageType} no descargable (sin mediaKey) de ${nombre} (${telefono})`);
+        } else {
+          try {
+            const buffer = await descargarConReintentos(m, sock, 3);
 
-          const msg = m.message[messageType];
+            let carpeta = 'docs';
+            if (messageType === 'imageMessage') carpeta = 'images';
+            else if (messageType === 'videoMessage') carpeta = 'videos';
+            else if (messageType === 'audioMessage') carpeta = 'audios';
+            else if (messageType === 'stickerMessage') carpeta = 'stickers';
 
-          if (messageType === 'imageMessage') carpeta = 'images';
-          else if (messageType === 'videoMessage') carpeta = 'videos';
-          else if (messageType === 'audioMessage') carpeta = 'audios';
+            let ext = '.bin';
+            if (msg.mimetype) {
+              const match = msg.mimetype.match(/\/([a-zA-Z0-9]+)/);
+              if (match) ext = '.' + match[1].toLowerCase();
+            }
+            if (messageType === 'audioMessage') ext = msg.ptt ? '.ogg' : '.mp3';
+            if (messageType === 'stickerMessage') ext = '.webp';
 
-          if (msg.mimetype) {
-            const extMatch = msg.mimetype.match(/\/([a-zA-Z0-9]+)$/);
-            if (extMatch) ext = '.' + extMatch[1].toLowerCase();
+            const safeName = (msg.fileName || 'archivo').replace(/[/\\?%*:|"<>]/g, '_');
+            const filename = `${Date.now()}_${telefono.replace(/[^0-9]/g, '') || 'unknown'}_${safeName}${ext}`;
+            const rutaArchivo = path.join('media', carpeta, filename);
+
+            fs.writeFileSync(rutaArchivo, buffer);
+
+            archivo = path.join('media', carpeta, filename).replace(/\\/g, '/');
+          } catch (err) {
+            console.log(`❌ Error descargando ${messageType} de ${nombre} (${telefono}): ${err.message}`);
           }
-
-          const filename = `${Date.now()}_${telefono}_${msg.fileName || 'file'}${ext}`;
-          const rutaCarpeta = path.join('media', carpeta);
-          const rutaArchivo = path.join(rutaCarpeta, filename);
-
-          fs.mkdirSync(rutaCarpeta, { recursive: true });
-          fs.writeFileSync(rutaArchivo, buffer);
-
-          archivo = path.join('media', carpeta, filename).replace(/\\/g, '/');
-        } catch (err) {
-          console.error('Error descargando archivo:', err);
         }
       }
 
-      guardar(telefono, texto, messageType, archivo);
+      guardar(telefono, nombre, jid, texto, messageType, archivo);
+
+      let log = `Nuevo registro → ${telefono} (${nombre}) - Tipo: ${messageType}`;
+      if (texto) log += ` → "${texto.substring(0, 50)}${texto.length > 50 ? '...' : ''}"`;
+      if (archivo) log += ' [Archivo guardado]';
+      console.log(log);
     }
   });
 }
 
-start().catch(err => console.error('Error crítico:', err));
+start().catch(err => console.error('Error crítico al iniciar:', err));
